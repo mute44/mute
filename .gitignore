@@ -1,0 +1,4 @@
+tor_data/
+__pycache__/
+venv
+tor_bundle/
