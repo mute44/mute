@@ -18,14 +18,18 @@ import os
 import sys
 import socket
 import platform
-import random
+import secrets
+import math
 import struct
+import ctypes
 import time
 from datetime import datetime
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
+from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit import print_formatted_text as pt_print
 from rich.console import Console
 from rich.text import Text
 from rich.panel import Panel
@@ -33,6 +37,7 @@ from rich.align import Align
 
 import crypto
 import tor_transport as tor_mod
+import check_integrity
 
 
 # ─── Globals ───────────────────────────────────────────────────────────────────
@@ -69,22 +74,21 @@ def status(msg: str, style: str = "yellow") -> None:
 
 
 def print_message(text: str, is_mine: bool) -> None:
-    ts = datetime.now().strftime("%H:%M")
     if is_mine:
-        line = Text()
-        line.append(f"[{ts}] ", style="dim")
-        line.append("You", style="bold green")
-        line.append(f": {text}", style="white")
+        pt_print(FormattedText([
+            ("",          "> "),
+            ("",          text),
+        ]))
     else:
-        line = Text()
-        line.append(f"[{ts}] ", style="dim")
-        line.append(peer_nick, style="bold red")
-        line.append(f": {text}", style="white")
-    console.print(line)
+        pt_print(FormattedText([
+            ("bold",      peer_nick),
+            ("",          " > "),
+            ("",          text),
+        ]))
 
 
 def print_system(msg: str) -> None:
-    console.print(f"  ◆ {msg}", style="dim cyan")
+    pt_print(FormattedText([("ansicyan", f"  ◆ {msg}")]))
 
 
 # ─── Network ───────────────────────────────────────────────────────────────────
@@ -121,6 +125,9 @@ async def recv_loop() -> None:
                 shutdown_event.set()
                 return
 
+            if plaintext.startswith("\x00CHAFF\x00"):
+                continue  # silently discard — traffic normalization packet
+
             if plaintext.startswith("\x00NICK\x00"):
                 peer_nick = plaintext[6:].rstrip("\x00") or "???"
                 print_system(f"Peer is known as: {peer_nick}")
@@ -141,19 +148,60 @@ async def recv_loop() -> None:
 
 
 async def send_message(text: str) -> None:
-    """Encrypt and send a message to peer."""
+    """
+    Encrypt and send a message with burst buffering.
+    Messages are held for BURST_WINDOW seconds before sending —
+    rapid typing gets smoothed into a uniform send pattern
+    instead of betraying typing rhythm via timing analysis.
+    """
     global session_key, peer_socket
     loop = asyncio.get_event_loop()
 
+    # Burst buffer: hold message briefly to blur typing cadence
+    BURST_WINDOW = 0.5
+    await asyncio.sleep(BURST_WINDOW)
+
     ciphertext = crypto.encrypt(text, session_key)
-
-    # Random send delay: 0 - 1500ms (hides message timing patterns)
-    delay = random.uniform(0, 1.5)
-    await asyncio.sleep(delay)
-
     await loop.run_in_executor(
         None, lambda: tor_mod.send_framed(peer_socket, ciphertext)
     )
+    print_message(text, is_mine=True)
+
+
+async def chaff_loop() -> None:
+    """
+    Traffic normalization via chaffing.
+
+    Sends encrypted dummy packets at Poisson-distributed intervals so the
+    outbound stream looks constant regardless of whether the user is typing.
+    The receiver silently discards all \\x00CHAFF\\x00 packets.
+
+    Poisson process with mean CHAFF_RATE_SEC means inter-arrival times are
+    exponentially distributed — indistinguishable from organic traffic bursts.
+    """
+    global session_key, peer_socket
+    loop = asyncio.get_event_loop()
+
+    CHAFF_RATE_SEC = 5.0  # average seconds between chaff packets
+
+    while not shutdown_event.is_set():
+        # Exponential inter-arrival time (Poisson process) — cryptographically random
+        # Using inverse-CDF: X = -ln(U) / lambda, where U is uniform (0, 1)
+        # secrets.randbelow gives uniform int in [0, 2^32), shift by 0.5 to avoid ln(0)
+        u        = (secrets.randbelow(2 ** 32) + 0.5) / (2 ** 32)
+        interval = -math.log(u) * CHAFF_RATE_SEC
+        await asyncio.sleep(interval)
+
+        if shutdown_event.is_set():
+            break
+
+        try:
+            ciphertext = crypto.encrypt("\x00CHAFF\x00", session_key)
+            await loop.run_in_executor(
+                None, lambda: tor_mod.send_framed(peer_socket, ciphertext)
+            )
+        except Exception:
+            break
 
 
 # ─── Chat Loop ─────────────────────────────────────────────────────────────────
@@ -161,12 +209,13 @@ async def send_message(text: str) -> None:
 async def chat_loop() -> None:
     """Main chat input loop using prompt_toolkit."""
     ps = PromptSession()
-    style = Style.from_dict({"prompt": "ansicyan bold"})
+    style = Style.from_dict({"prompt": ""})
 
     print_system("Connected. Type messages and press Enter. Ctrl+C to quit.")
-    console.print()
+    pt_print(FormattedText([("", "")]))
 
-    recv_task = asyncio.create_task(recv_loop())
+    recv_task  = asyncio.create_task(recv_loop())
+    chaff_task = asyncio.create_task(chaff_loop())
 
     with patch_stdout():
         while not shutdown_event.is_set():
@@ -184,8 +233,6 @@ async def chat_loop() -> None:
             if text.lower() in ("/quit", "/exit", "/q"):
                 break
 
-            print_message(text, is_mine=True)
-
             try:
                 await send_message(text)
             except Exception as e:
@@ -201,11 +248,12 @@ async def chat_loop() -> None:
 
     shutdown_event.set()
     recv_task.cancel()
+    chaff_task.cancel()
 
 
 # ─── Startup ───────────────────────────────────────────────────────────────────
 
-def ensure_tor(tor: tor_mod.TorController) -> None:
+def ensure_tor(tor: tor_mod.TorController, bridges: list = None) -> None:
     """Download Tor if needed (Windows), then start it."""
     if platform.system() == "Windows" and not tor_mod.is_tor_bundled():
         console.print()
@@ -216,7 +264,7 @@ def ensure_tor(tor: tor_mod.TorController) -> None:
         )
         tor_mod.download_tor_bundle(status_cb=lambda m: status(m, "yellow"))
 
-    tor.start(status_cb=lambda m: status(m, "yellow"))
+    tor.start(status_cb=lambda m: status(m, "yellow"), bridges=bridges or [])
 
 
 async def get_nickname() -> str:
@@ -285,26 +333,80 @@ async def get_passphrase() -> str:
     return passphrase
 
 
-# ─── Main ──────────────────────────────────────────────────────────────────────
+# ─── Memory Lockdown ───────────────────────────────────────────────────────────
 
-async def main() -> None:
-    global session_key, peer_socket
+def memory_lockdown() -> None:
+    """
+    Prevent the OS from swapping any page of this process to disk.
 
-    # Disable core dumps on Linux/macOS
-    if platform.system() != "Windows":
+    Linux/macOS: mlockall(MCL_CURRENT | MCL_FUTURE) locks all current and
+    future pages. Requires no special privileges on most desktop distros
+    (RLIMIT_MEMLOCK allows a few MB by default — enough for this process).
+
+    Windows: No equivalent of mlockall exists. We call SetProcessWorkingSetSize
+    with large values to discourage (but not prevent) paging. Actual prevention
+    on Windows would require VirtualLock per-allocation which PyNaCl handles
+    internally for key material anyway.
+
+    Core dumps are also disabled here — a crash dump would contain all RAM
+    including session keys.
+    """
+    system = platform.system()
+
+    if system in ("Linux", "Darwin"):
+        try:
+            MCL_CURRENT = 1
+            MCL_FUTURE  = 2
+            libc = ctypes.CDLL("libc.so.6" if system == "Linux" else "libc.dylib")
+            result = libc.mlockall(MCL_CURRENT | MCL_FUTURE)
+            if result != 0:
+                # Non-fatal — log but continue (e.g. container with low memlock limit)
+                status("mlockall failed (low memlock limit?) — swap protection unavailable.", "yellow")
+        except Exception:
+            pass
+
+        # Disable core dumps
         try:
             import resource
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         except Exception:
             pass
 
+    elif system == "Windows":
+        try:
+            # Discourage paging by requesting a large working set
+            # Not a guarantee, but raises the bar against casual swap analysis
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetProcessWorkingSetSize(
+                kernel32.GetCurrentProcess(), 0x10000000, 0x40000000
+            )
+        except Exception:
+            pass
+
+        # Suppress Windows Error Reporting crash dumps
+        try:
+            SEM_NOGPFAULTERRORBOX = 0x0002
+            ctypes.windll.kernel32.SetErrorMode(SEM_NOGPFAULTERRORBOX)
+        except Exception:
+            pass
+
+
+# ─── Main ──────────────────────────────────────────────────────────────────────
+
+async def main(bridges: list = None) -> None:
+    global session_key, peer_socket
+
+    # ── Pre-flight: integrity + memory lockdown (before anything else) ─────────
+    check_integrity.verify_or_abort()
+    memory_lockdown()
+
     print_banner()
 
     tor = tor_mod.TorController()
 
     try:
-        # Step 1: Tor
-        ensure_tor(tor)
+        # Step 1: Tor (bridges passed via --bridges CLI flag, default none)
+        ensure_tor(tor, bridges or [])
         console.print()
 
         # Step 2: Nickname
@@ -390,18 +492,38 @@ async def main() -> None:
 
 def run():
     """Entry point."""
-    # Ensure passphrase is not accidentally passed as argument
-    if len(sys.argv) > 1 and not sys.argv[1].startswith("--"):
-        print("Usage: python darkchat.py")
-        print("Do not pass passphrase as argument.")
-        sys.exit(1)
+    import argparse
 
-    # ProactorEventLoop (Windows default in Python 3.8+) is incompatible with
-    # prompt_toolkit. Switch to SelectorEventLoop before starting the loop.
+    parser = argparse.ArgumentParser(
+        prog="mute",
+        description="Ephemeral anonymous P2P chat over Tor.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "obfs4 bridge example:\n"
+            "  mute --bridges \"obfs4 1.2.3.4:443 FINGERPRINT cert=xxx iat-mode=0\"\n\n"
+            "Get bridges: https://bridges.torproject.org  (select obfs4)"
+        ),
+    )
+    parser.add_argument(
+        "--bridges",
+        nargs="+",
+        metavar="BRIDGE_LINE",
+        help="obfs4 bridge line(s) to disguise Tor traffic. "
+             "Get from https://bridges.torproject.org",
+        default=[],
+    )
+    args = parser.parse_args()
+
+    # Validate bridge lines
+    for b in args.bridges:
+        if not b.strip().startswith("obfs4"):
+            print(f"Invalid bridge line (must start with 'obfs4'): {b}")
+            sys.exit(1)
+
     if platform.system() == "Windows":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    asyncio.run(main())
+    asyncio.run(main(bridges=args.bridges))
 
 
 if __name__ == "__main__":

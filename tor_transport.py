@@ -1,9 +1,10 @@
 """
-DarkChat :: tor_transport.py
+MUTE :: tor_transport.py
 Tor management and P2P connection.
 
 - Auto-downloads Tor Expert Bundle on Windows if not present
 - Launches Tor with privacy-hardened config
+- Optional obfs4 pluggable transport (hides Tor traffic from ISP)
 - Creates deterministic ephemeral v3 hidden service
 - Race mechanism: both peers try host + client simultaneously
   → first successful connection determines roles
@@ -14,7 +15,7 @@ import os
 import sys
 import socket
 import struct
-import random
+import secrets
 import tarfile
 import tempfile
 import platform
@@ -34,11 +35,14 @@ import crypto
 
 BUNDLE_DIR   = Path(__file__).parent / "tor_bundle"
 DATA_DIR     = Path(__file__).parent / "tor_data"
-TOR_EXE      = BUNDLE_DIR / "tor" / "tor.exe"   # Windows path inside bundle
+TOR_EXE      = BUNDLE_DIR / "tor" / "tor.exe"
 
-TOR_SOCKS_PORT   = 19050   # Non-standard to avoid conflicts with system Tor
+# obfs4proxy is shipped inside the Tor Expert Bundle on Windows
+OBFS4_EXE    = BUNDLE_DIR / "tor" / "pluggable_transports" / "obfs4proxy.exe"
+
+TOR_SOCKS_PORT   = 19050
 TOR_CONTROL_PORT = 19051
-HS_LOCAL_PORT    = 19052   # Port hidden service maps to on localhost
+HS_LOCAL_PORT    = 19052
 
 
 # ─── Tor Download ──────────────────────────────────────────────────────────────
@@ -56,6 +60,31 @@ TOR_BUNDLE_URL = (
 def is_tor_bundled() -> bool:
     """Check if Tor bundle already downloaded."""
     return TOR_EXE.exists()
+
+
+def is_obfs4_available() -> bool:
+    """Check if obfs4proxy is available (bundled on Windows, system PATH on Linux)."""
+    if platform.system() == "Windows":
+        return OBFS4_EXE.exists()
+    import shutil
+    return shutil.which("obfs4proxy") is not None
+
+
+def get_obfs4_binary() -> str:
+    """Return absolute path to obfs4proxy binary."""
+    if platform.system() == "Windows":
+        if not OBFS4_EXE.exists():
+            raise RuntimeError(
+                f"obfs4proxy.exe not found in Tor bundle.\n"
+                f"Expected: {OBFS4_EXE}\n"
+                "Re-download the Tor Expert Bundle to get it."
+            )
+        return str(OBFS4_EXE)
+    import shutil
+    binary = shutil.which("obfs4proxy")
+    if not binary:
+        raise RuntimeError("obfs4proxy not found. Install: sudo apt install obfs4proxy")
+    return binary
 
 
 def get_tor_binary() -> str:
@@ -133,28 +162,55 @@ class TorController:
         self._controller = None
         self._hs_id      = None   # service_id (without .onion)
 
-    def start(self, status_cb: Optional[Callable[[str], None]] = None) -> None:
-        """Launch Tor process and authenticate controller. Blocks until ready."""
+    def start(
+        self,
+        status_cb: Optional[Callable[[str], None]] = None,
+        bridges:   Optional[list] = None,
+    ) -> None:
+        """
+        Launch Tor process and authenticate controller. Blocks until ready.
+
+        bridges: optional list of obfs4 bridge lines, e.g.:
+            ["obfs4 1.2.3.4:1234 FINGERPRINT cert=xxx iat-mode=0"]
+        If provided and obfs4proxy is available, Tor will use pluggable
+        transports — ISP sees random-looking traffic instead of Tor.
+        """
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 
         if status_cb:
             status_cb("Starting Tor...")
 
         config = {
-            # IsolateClientAddr and IsolateClientProtocol are SocksPort flags, not standalone options
             "SocksPort":       f"{TOR_SOCKS_PORT} IsolateClientAddr IsolateClientProtocol",
             "ControlPort":     str(TOR_CONTROL_PORT),
             "DataDirectory":   str(DATA_DIR),
-            # stem needs NOTICE stdout to detect bootstrap completion
             "Log":             ["NOTICE stdout", "ERR stderr"],
             # Privacy hardening
             "ConnectionPadding":      "1",
             "EnforceDistinctSubnets": "1",
-            "ExcludeExitNodes":       "{??}",   # Don't use exit nodes (not needed)
+            "ExcludeExitNodes":       "{??}",
             "StrictNodes":            "0",
+            # NOTE: EntryNodes removed — even as a soft preference (StrictNodes 0)
+            # it causes significantly longer bootstrap times and hangs on Windows
+            # where stem has no timeout mechanism. Guard diversity handled by Tor itself.
         }
 
-        # timeout uses UNIX signals — must be None on Windows (stem default is 90 which also crashes)
+        # ── obfs4 pluggable transport (activated via --bridges CLI flag) ───────
+        if bridges:
+            if not is_obfs4_available():
+                if status_cb:
+                    status_cb(
+                        "obfs4proxy not found in Tor bundle — starting without bridges."
+                    )
+            else:
+                obfs4_bin = get_obfs4_binary()
+                config["UseBridges"] = "1"
+                config["ClientTransportPlugin"] = f"obfs4 exec {obfs4_bin}"
+                config["Bridge"] = bridges
+                if status_cb:
+                    status_cb(f"obfs4 enabled ({len(bridges)} bridge(s)). Traffic is camouflaged.")
+
+        # timeout uses UNIX signals — must be None on Windows
         tor_timeout = None if platform.system() == "Windows" else 120
 
         self._process = stem.process.launch_tor_with_config(

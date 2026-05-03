@@ -4,7 +4,7 @@ All cryptographic operations.
 
 Passphrase → HKDF → room_key + daily_onion_seed
 Ephemeral X25519 ECDH → session_key (Perfect Forward Secrecy)
-XSalsa20-Poly1305 encryption with random-length padding
+XSalsa20-Poly1305 encryption with dynamic padding (1024–4096 bytes)
 HMAC-protected public key exchange (MITM prevention)
 """
 
@@ -26,8 +26,9 @@ import nacl.bindings
 import nacl.signing
 
 
-APP_CONTEXT = b"mute-v1"
-PADDING_BLOCK = 1024  # bytes — all messages padded to multiple of this
+APP_CONTEXT    = b"mute-v1"
+PADDING_MIN    = 1024   # bytes — minimum padded size
+PADDING_MAX    = 4096   # bytes — maximum padded size (dynamic per message)
 
 
 # ─── Key Derivation ────────────────────────────────────────────────────────────
@@ -136,23 +137,31 @@ def derive_session_key(our_priv: nacl.public.PrivateKey,
 
 def confirm_token(session_key: bytes) -> bytes:
     """Both sides compute this after handshake to verify matching session keys."""
-    return hmac.new(bytes(session_key), b"mute-confirm", hashlib.sha256).digest()
+    return hmac.new(bytes(session_key), b"darkchat-confirm", hashlib.sha256).digest()
 
 
 # ─── Message Encryption ────────────────────────────────────────────────────────
 
 def encrypt(plaintext: str, session_key: bytes) -> bytes:
     """
-    Encrypt with random-length padding:
-    - padded to next multiple of PADDING_BLOCK
-    - plus 0-3 extra random blocks
-    Hides message length from traffic analysis.
+    Encrypt with dynamic padding:
+    - target size drawn uniformly from [PADDING_MIN, PADDING_MAX]
+    - if plaintext exceeds PADDING_MAX, pad to next multiple of PADDING_MAX
+    Each packet has a different size — prevents length-based fingerprinting
+    even when the adversary knows PADDING_MIN.
     """
     data = plaintext.encode("utf-8")
-    extra_blocks = int.from_bytes(os.urandom(1), "big") % 4
-    target = ((len(data) // PADDING_BLOCK) + 1 + extra_blocks) * PADDING_BLOCK
-    padded = data + b"\x00" * (target - len(data))
 
+    # Random target in [PADDING_MIN, PADDING_MAX]
+    rand_word = int.from_bytes(os.urandom(2), "big")
+    span      = PADDING_MAX - PADDING_MIN
+    target    = PADDING_MIN + (rand_word % (span + 1))
+
+    # If message is larger than target, overflow to next PADDING_MAX boundary
+    if len(data) >= target:
+        target = ((len(data) // PADDING_MAX) + 1) * PADDING_MAX
+
+    padded = data + b"\x00" * (target - len(data))
     box = nacl.secret.SecretBox(bytes(session_key))
     return box.encrypt(padded)
 
@@ -179,7 +188,20 @@ def read_length(header: bytes) -> int:
 # ─── Secure Memory Wipe ────────────────────────────────────────────────────────
 
 def wipe(ba: bytearray) -> None:
-    """Overwrite bytearray in-place with zeros. Use for all key material."""
-    if isinstance(ba, bytearray) and len(ba) > 0:
-        for i in range(len(ba)):
-            ba[i] = 0
+    """
+    Physically overwrite bytearray with zeros using ctypes.memset.
+
+    Python's `del` only removes the reference — the object may linger in RAM
+    until GC collects it. ctypes.memset writes zeros directly to the buffer's
+    memory address before the reference is dropped, preventing key material
+    from surviving in RAM or leaking to swap.
+    """
+    if not isinstance(ba, bytearray) or len(ba) == 0:
+        return
+
+    # Get raw pointer to the bytearray's internal buffer
+    addr = ctypes.addressof((ctypes.c_char * len(ba)).from_buffer(ba))
+    ctypes.memset(addr, 0, len(ba))
+
+    # Belt-and-suspenders: zero via slice too (in case of buffer copy edge cases)
+    ba[:] = b"\x00" * len(ba)

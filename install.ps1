@@ -1,14 +1,14 @@
 # MUTE installer for Windows
-# Usage: irm https://raw.githubusercontent.com/mute44/mute/main/install.ps1 | iex
+# Usage: irm https://raw.githubusercontent.com/YOUR_USERNAME/mute/main/install.ps1 | iex
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$REPO_RAW    = "https://raw.githubusercontent.com/mute44/mute/main"
+$REPO_RAW    = "https://raw.githubusercontent.com/YOUR_USERNAME/mute/main"
 $INSTALL_DIR = "$env:USERPROFILE\.mute"
 $VENV_DIR    = "$INSTALL_DIR\venv"
 $PYTHON      = "$VENV_DIR\Scripts\python.exe"
-$FILES       = @("mute.py", "crypto.py", "tor_transport.py", "requirements.txt")
+$FILES       = @("mute.py", "crypto.py", "tor_transport.py", "check_integrity.py", "requirements.txt")
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -154,6 +154,15 @@ if ($added) {
 } else {
     Write-Ok "Already in PATH"
 }
+
+# 8. Integrity baseline
+Write-Step "Generating integrity checksums..."
+& $PYTHON "$INSTALL_DIR\check_integrity.py" --update | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Fail "Failed to generate integrity checksums."
+    exit 1
+}
+Write-Ok "checksums.sha256 created"
 
 # ─── Done ─────────────────────────────────────────────────────────────────────
 

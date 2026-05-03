@@ -2,3 +2,5 @@ tor_data/
 __pycache__/
 venv
 tor_bundle/
+checksums.sha256
+commands/
